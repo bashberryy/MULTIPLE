@@ -1,0 +1,170 @@
+name: Build MULTIPLE
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: "Board name (must match an entry in boards/boards.json)"
+        required: true
+        default: "nissa"
+
+concurrency:
+  group: multiple-build-${{ github.event.inputs.board || 'manual' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate board exists
+        env:
+          BOARD: ${{ github.event.inputs.board }}
+        run: |
+          set -e
+          python3 - <<'PY'
+          import json, os, sys
+
+          board = os.environ["BOARD"]
+
+          BOARD_ALIASES = {
+              "craasneto": "nissa",
+              "craask":    "nissa",
+          }
+
+          resolved = BOARD_ALIASES.get(board.strip().lower(), board.strip().lower())
+
+          with open("boards/boards.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          boards = [k for k in data.keys() if not k.startswith("_")]
+
+          if resolved not in boards:
+              print(f"Board '{board}' (resolved: '{resolved}') not found in boards/boards.json", file=sys.stderr)
+              sys.exit(2)
+
+          if resolved != board:
+              print(f"Board alias '{board}' resolved to '{resolved}'")
+          print("Board validated:", resolved)
+          PY
+
+      - name: Resolve board name
+        id: resolve
+        env:
+          BOARD: ${{ github.event.inputs.board }}
+        run: |
+          RESOLVED=$(python3 -c "
+          import sys
+          ALIASES = {'craasneto': 'nissa', 'craask': 'nissa'}
+          b = sys.argv[1].strip().lower()
+          print(ALIASES.get(b, b))
+          " "$BOARD")
+          echo "board=$RESOLVED" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 unzip curl e2fsprogs
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/share/dotnet \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: Cache shim
+        id: cache-shim
+        uses: actions/cache@v4
+        with:
+          path: shim_cache
+          key: shim-${{ steps.resolve.outputs.board }}-v1
+
+      - name: Download shim (cache miss)
+        if: steps.cache-shim.outputs.cache-hit != 'true'
+        env:
+          RESOLVED: ${{ steps.resolve.outputs.board }}
+        run: |
+          set -e
+          mkdir -p shim_cache
+          URL="https://dl.cros.download/files/${RESOLVED}/${RESOLVED}.zip"
+          echo "Downloading shim from $URL"
+          curl -fL --retry 3 --retry-delay 5 -o shim_cache/${RESOLVED}.zip "$URL"
+          python3 - <<PY
+          import os, zipfile, shutil
+
+          board = os.environ["RESOLVED"]
+          src   = f"shim_cache/{board}.zip"
+          dest  = f"shim_cache/{board}.bin"
+
+          if not zipfile.is_zipfile(src):
+              os.rename(src, dest)
+          else:
+              with zipfile.ZipFile(src, "r") as zf:
+                  bins = [n for n in zf.namelist() if n.lower().endswith(".bin")]
+                  if not bins:
+                      raise RuntimeError("No .bin in shim zip")
+                  match = next((n for n in bins if os.path.basename(n).lower() == f"{board}.bin"), bins[0])
+                  with zf.open(match) as src_f, open(dest, "wb") as dst_f:
+                      shutil.copyfileobj(src_f, dst_f)
+              os.remove(src)
+
+          size = os.path.getsize(dest)
+          print(f"Shim saved: {dest} ({size // 1024 // 1024} MB)")
+          PY
+
+      - name: Run build
+        env:
+          GITHUB_ACTIONS: "true"
+          RESOLVED: ${{ steps.resolve.outputs.board }}
+          BOARD: ${{ github.event.inputs.board }}
+        run: |
+          set -e
+          SHIM="shim_cache/${RESOLVED}.bin"
+          echo "Using shim: $SHIM ($(du -h "$SHIM" | cut -f1))"
+          python3 build.py "$BOARD" "$SHIM"
+
+      - name: Validate output
+        env:
+          BOARD: ${{ github.event.inputs.board }}
+          RESOLVED: ${{ steps.resolve.outputs.board }}
+        run: |
+          set -e
+          ZIP="dist/multiple_${RESOLVED}.zip"
+
+          if [ ! -s "$ZIP" ]; then
+            echo "Build output not found: $ZIP" >&2
+            exit 1
+          fi
+
+          echo "Archive contents:"
+          unzip -l "$ZIP"
+
+          COUNT=$(unzip -Z1 "$ZIP" | grep -c '\.bin$' || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "Expected exactly one .bin file, found $COUNT" >&2
+            exit 1
+          fi
+
+          INNER=$(unzip -Z1 "$ZIP" | grep '\.bin$' | head -n1)
+          EXPECTED="chromeos_multiple_${RESOLVED}.bin"
+          if [ "$INNER" != "$EXPECTED" ]; then
+            echo "Unexpected inner bin name: $INNER (expected $EXPECTED)" >&2
+            exit 2
+          fi
+
+          echo "Output validated."
+          echo "ZIP size: $(du -h "$ZIP" | cut -f1)"
+          sha256sum "$ZIP"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multiple-${{ github.event.inputs.board }}
+          path: dist/multiple_${{ steps.resolve.outputs.board }}.zip
+          retention-days: 14
