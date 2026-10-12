@@ -648,6 +648,20 @@ def verify_zip(out_zip: str, inner_name: str, board: str) -> None:
         if entries[0] != inner_name:
             raise RuntimeError(f"wrong inner bin name: {entries[0]} (expected {inner_name})")
 
+        # A ChromeOS disk image is not the same thing as a ROOT-A filesystem
+        # partition. Require a protective MBR and GPT header before calling a
+        # .bin a disk image. This is a format sanity check, not proof that the
+        # image is signed, bootable, or appropriate for a particular board.
+        with zf.open(entries[0], "r") as image:
+            header = image.read(1024)
+        if len(header) < 1024 or header[510:512] != b"\x55\xaa" or header[512:520] != b"EFI PART":
+            raise RuntimeError(
+                "refusing to label this artifact a ChromeOS disk image: the packaged .bin "
+                "does not contain a protective MBR and GPT header. The current build path "
+                "packages ROOT-A alone, which is a filesystem partition, not a complete "
+                "bootable disk image. No bootable image was produced."
+            )
+
 
 # ── main build ────────────────────────────────────────────────────────────────
 
@@ -743,10 +757,19 @@ def build(board_in: str, local_shim: Optional[str] = None) -> str:
         # package output
         inner_name = f"chromeos_multiple_{board}.bin"
         tmp_out    = out_zip + f".tmp{os.getpid()}"
-        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
-            zf.write(roota_tmp, inner_name)
-        verify_zip(tmp_out, inner_name, board)
-        os.replace(tmp_out, out_zip)
+        try:
+            with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+                zf.write(roota_tmp, inner_name)
+            verify_zip(tmp_out, inner_name, board)
+            os.replace(tmp_out, out_zip)
+        except Exception:
+            # A failed validation must not leave an apparently usable artifact.
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except OSError:
+                pass
+            raise
 
         print(f"[build:{board}] done: {out_zip} ({os.path.getsize(out_zip)//1024//1024} MB)")
         return out_zip
